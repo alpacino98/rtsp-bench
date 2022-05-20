@@ -1,8 +1,10 @@
+//go:build !js
 // +build !js
 
 package webrtc
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -18,12 +20,13 @@ import (
 // trackDetails represents any media source that can be represented in a SDP
 // This isn't keyed by SSRC because it also needs to support rid based sources
 type trackDetails struct {
-	mid      string
-	kind     RTPCodecType
-	streamID string
-	id       string
-	ssrcs    []SSRC
-	rids     []string
+	mid        string
+	kind       RTPCodecType
+	streamID   string
+	id         string
+	ssrcs      []SSRC
+	repairSsrc *SSRC
+	rids       []string
 }
 
 func trackDetailsForSSRC(trackDetails []trackDetails, ssrc SSRC) *trackDetails {
@@ -73,7 +76,7 @@ func filterTrackWithSSRC(incomingTracks []trackDetails, ssrc SSRC) []trackDetail
 func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) (incomingTracks []trackDetails) { // nolint:gocognit
 	for _, media := range s.MediaDescriptions {
 		tracksInMediaSection := []trackDetails{}
-		rtxRepairFlows := map[uint32]bool{}
+		rtxRepairFlows := map[uint64]uint64{}
 
 		// Plan B can have multiple tracks in a signle media section
 		streamID := ""
@@ -106,7 +109,7 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) (
 					// as this declares that the second SSRC (632943048) is a rtx repair flow (RFC4588) for the first
 					// (2231627014) as specified in RFC5576
 					if len(split) == 3 {
-						_, err := strconv.ParseUint(split[1], 10, 32)
+						baseSsrc, err := strconv.ParseUint(split[1], 10, 32)
 						if err != nil {
 							log.Warnf("Failed to parse SSRC: %v", err)
 							continue
@@ -116,7 +119,7 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) (
 							log.Warnf("Failed to parse SSRC: %v", err)
 							continue
 						}
-						rtxRepairFlows[uint32(rtxRepairFlow)] = true
+						rtxRepairFlows[rtxRepairFlow] = baseSsrc
 						tracksInMediaSection = filterTrackWithSSRC(tracksInMediaSection, SSRC(rtxRepairFlow)) // Remove if rtx was added as track before
 					}
 				}
@@ -139,7 +142,7 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) (
 					continue
 				}
 
-				if rtxRepairFlow := rtxRepairFlows[uint32(ssrc)]; rtxRepairFlow {
+				if _, ok := rtxRepairFlows[ssrc]; ok {
 					continue // This ssrc is a RTX repair flow, ignore
 				}
 
@@ -165,6 +168,13 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) (
 				trackDetails.id = trackID
 				trackDetails.ssrcs = []SSRC{SSRC(ssrc)}
 
+				for r, baseSsrc := range rtxRepairFlows {
+					if baseSsrc == ssrc {
+						repairSsrc := SSRC(r)
+						trackDetails.repairSsrc = &repairSsrc
+					}
+				}
+
 				if isNewTrack {
 					tracksInMediaSection = append(tracksInMediaSection, *trackDetails)
 				}
@@ -182,11 +192,6 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) (
 			for rid := range rids {
 				simulcastTrack.rids = append(simulcastTrack.rids, rid)
 			}
-			if len(simulcastTrack.rids) == len(tracksInMediaSection) {
-				for i := range tracksInMediaSection {
-					simulcastTrack.ssrcs = append(simulcastTrack.ssrcs, tracksInMediaSection[i].ssrcs...)
-				}
-			}
 
 			tracksInMediaSection = []trackDetails{simulcastTrack}
 		}
@@ -195,6 +200,29 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) (
 	}
 
 	return incomingTracks
+}
+
+func trackDetailsToRTPReceiveParameters(t *trackDetails) RTPReceiveParameters {
+	encodingSize := len(t.ssrcs)
+	if len(t.rids) >= encodingSize {
+		encodingSize = len(t.rids)
+	}
+
+	encodings := make([]RTPDecodingParameters, encodingSize)
+	for i := range encodings {
+		if len(t.rids) > i {
+			encodings[i].RID = t.rids[i]
+		}
+		if len(t.ssrcs) > i {
+			encodings[i].SSRC = t.ssrcs[i]
+		}
+
+		if t.repairSsrc != nil {
+			encodings[i].RTX.SSRC = *t.repairSsrc
+		}
+	}
+
+	return RTPReceiveParameters{Encodings: encodings}
 }
 
 func getRids(media *sdp.MediaDescription) map[string]string {
@@ -312,7 +340,60 @@ func populateLocalCandidates(sessionDescription *SessionDescription, i *ICEGathe
 	}
 }
 
-func addTransceiverSDP(d *sdp.SessionDescription, isPlanB, shouldAddCandidates bool, dtlsFingerprints []DTLSFingerprint, mediaEngine *MediaEngine, midValue string, iceParams ICEParameters, candidates []ICECandidate, dtlsRole sdp.ConnectionRole, iceGatheringState ICEGatheringState, mediaSection mediaSection) (bool, error) {
+func addSenderSDP(
+	mediaSection mediaSection,
+	isPlanB bool,
+	media *sdp.MediaDescription,
+) {
+	for _, mt := range mediaSection.transceivers {
+		sender := mt.Sender()
+		if sender == nil {
+			continue
+		}
+
+		track := sender.Track()
+		if track == nil {
+			continue
+		}
+
+		sendParameters := sender.GetParameters()
+		for _, encoding := range sendParameters.Encodings {
+			media = media.WithMediaSource(uint32(encoding.SSRC), track.StreamID() /* cname */, track.StreamID() /* streamLabel */, track.ID())
+			if !isPlanB {
+				media = media.WithPropertyAttribute("msid:" + track.StreamID() + " " + track.ID())
+			}
+		}
+
+		if len(sendParameters.Encodings) > 1 {
+			sendRids := make([]string, 0, len(sendParameters.Encodings))
+
+			for _, encoding := range sendParameters.Encodings {
+				media.WithValueAttribute(sdpAttributeRid, encoding.RID+" send")
+				sendRids = append(sendRids, encoding.RID)
+			}
+			// Simulcast
+			media.WithValueAttribute("simulcast", "send "+strings.Join(sendRids, ";"))
+		}
+
+		if !isPlanB {
+			break
+		}
+	}
+}
+
+func addTransceiverSDP(
+	d *sdp.SessionDescription,
+	isPlanB bool,
+	shouldAddCandidates bool,
+	dtlsFingerprints []DTLSFingerprint,
+	mediaEngine *MediaEngine,
+	midValue string,
+	iceParams ICEParameters,
+	candidates []ICECandidate,
+	dtlsRole sdp.ConnectionRole,
+	iceGatheringState ICEGatheringState,
+	mediaSection mediaSection,
+) (bool, error) {
 	transceivers := mediaSection.transceivers
 	if len(transceivers) < 1 {
 		return false, errSDPZeroTransceivers
@@ -343,12 +424,23 @@ func addTransceiverSDP(d *sdp.SessionDescription, isPlanB, shouldAddCandidates b
 		}
 
 		// Explicitly reject track if we don't have the codec
+		// We need to include connection information even if we're rejecting a track, otherwise Firefox will fail to
+		// parse the SDP with an error like:
+		// SIPCC Failed to parse SDP: SDP Parse Error on line 50:  c= connection line not specified for every media level, validation failed.
+		// In addition this makes our SDP compliant with RFC 4566 Section 5.7: https://datatracker.ietf.org/doc/html/rfc4566#section-5.7
 		d.WithMedia(&sdp.MediaDescription{
 			MediaName: sdp.MediaName{
 				Media:   t.kind.String(),
 				Port:    sdp.RangedPort{Value: 0},
 				Protos:  []string{"UDP", "TLS", "RTP", "SAVPF"},
 				Formats: []string{"0"},
+			},
+			ConnectionInformation: &sdp.ConnectionInformation{
+				NetworkType: "IN",
+				AddressType: "IP4",
+				Address: &sdp.Address{
+					Address: "0.0.0.0",
+				},
 			},
 		})
 		return false, nil
@@ -382,16 +474,7 @@ func addTransceiverSDP(d *sdp.SessionDescription, isPlanB, shouldAddCandidates b
 		media.WithValueAttribute("simulcast", "recv "+strings.Join(recvRids, ";"))
 	}
 
-	for _, mt := range transceivers {
-		if sender := mt.Sender(); sender != nil && sender.Track() != nil {
-			track := sender.Track()
-			media = media.WithMediaSource(uint32(sender.ssrc), track.StreamID() /* cname */, track.StreamID() /* streamLabel */, track.ID())
-			if !isPlanB {
-				media = media.WithPropertyAttribute("msid:" + track.StreamID() + " " + track.ID())
-				break
-			}
-		}
-	}
+	addSenderSDP(mediaSection, isPlanB, media)
 
 	media = media.WithPropertyAttribute(t.Direction().String())
 
@@ -418,7 +501,7 @@ type mediaSection struct {
 }
 
 // populateSDP serializes a PeerConnections state into an SDP
-func populateSDP(d *sdp.SessionDescription, isPlanB bool, dtlsFingerprints []DTLSFingerprint, mediaDescriptionFingerprint bool, isICELite bool, mediaEngine *MediaEngine, connectionRole sdp.ConnectionRole, candidates []ICECandidate, iceParams ICEParameters, mediaSections []mediaSection, iceGatheringState ICEGatheringState) (*sdp.SessionDescription, error) {
+func populateSDP(d *sdp.SessionDescription, isPlanB bool, dtlsFingerprints []DTLSFingerprint, mediaDescriptionFingerprint bool, isICELite bool, isExtmapAllowMixed bool, mediaEngine *MediaEngine, connectionRole sdp.ConnectionRole, candidates []ICECandidate, iceParams ICEParameters, mediaSections []mediaSection, iceGatheringState ICEGatheringState) (*sdp.SessionDescription, error) {
 	var err error
 	mediaDtlsFingerprints := []DTLSFingerprint{}
 
@@ -466,7 +549,11 @@ func populateSDP(d *sdp.SessionDescription, isPlanB bool, dtlsFingerprints []DTL
 
 	if isICELite {
 		// RFC 5245 S15.3
-		d = d.WithValueAttribute(sdp.AttrKeyICELite, sdp.AttrKeyICELite)
+		d = d.WithValueAttribute(sdp.AttrKeyICELite, "")
+	}
+
+	if isExtmapAllowMixed {
+		d = d.WithPropertyAttribute(sdp.AttrKeyExtMapAllowMixed)
 	}
 
 	return d.WithValueAttribute(sdp.AttrKeyGroup, bundleValue), nil
@@ -534,7 +621,7 @@ func extractFingerprint(desc *sdp.SessionDescription) (string, string, error) {
 	return parts[1], parts[0], nil
 }
 
-func extractICEDetails(desc *sdp.SessionDescription) (string, string, []ICECandidate, error) {
+func extractICEDetails(desc *sdp.SessionDescription, log logging.LeveledLogger) (string, string, []ICECandidate, error) { // nolint:gocognit
 	candidates := []ICECandidate{}
 	remotePwds := []string{}
 	remoteUfrags := []string{}
@@ -558,6 +645,10 @@ func extractICEDetails(desc *sdp.SessionDescription) (string, string, []ICECandi
 			if a.IsICECandidate() {
 				c, err := ice.UnmarshalCandidate(a.Value)
 				if err != nil {
+					if errors.Is(err, ice.ErrUnknownCandidateTyp) || errors.Is(err, ice.ErrDetermineNetworkType) {
+						log.Warnf("Discarding remote candidate: %s", err)
+						continue
+					}
 					return "", "", nil, err
 				}
 
@@ -627,7 +718,7 @@ func codecsFromMediaDescription(m *sdp.MediaDescription) (out []RTPCodecParamete
 	}
 
 	for _, payloadStr := range m.MediaName.Formats {
-		payloadType, err := strconv.Atoi(payloadStr)
+		payloadType, err := strconv.ParseUint(payloadStr, 10, 8)
 		if err != nil {
 			return nil, err
 		}
@@ -641,7 +732,7 @@ func codecsFromMediaDescription(m *sdp.MediaDescription) (out []RTPCodecParamete
 		}
 
 		channels := uint16(0)
-		val, err := strconv.Atoi(codec.EncodingParameters)
+		val, err := strconv.ParseUint(codec.EncodingParameters, 10, 16)
 		if err == nil {
 			channels = uint16(val)
 		}
@@ -699,4 +790,24 @@ func updateSDPOrigin(origin *sdp.Origin, d *sdp.SessionDescription) {
 		}
 		d.Origin.SessionVersion = atomic.AddUint64(&origin.SessionVersion, 1)
 	}
+}
+
+func isIceLiteSet(desc *sdp.SessionDescription) bool {
+	for _, a := range desc.Attributes {
+		if strings.TrimSpace(a.Key) == sdp.AttrKeyICELite {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isExtMapAllowMixedSet(desc *sdp.SessionDescription) bool {
+	for _, a := range desc.Attributes {
+		if strings.TrimSpace(a.Key) == sdp.AttrKeyExtMapAllowMixed {
+			return true
+		}
+	}
+
+	return false
 }

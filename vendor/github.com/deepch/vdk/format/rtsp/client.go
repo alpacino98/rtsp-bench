@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
+
 	//"log"
 	"net"
 	"net/textproto"
@@ -120,6 +122,7 @@ func DialTimeout(uri string, timeout time.Duration) (self *Client, err error) {
 }
 
 func Dial(uri string) (self *Client, err error) {
+	log.Println("Here")
 	return DialTimeout(uri, 0)
 }
 
