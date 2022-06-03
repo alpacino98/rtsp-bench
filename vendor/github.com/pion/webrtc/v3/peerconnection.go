@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -1929,11 +1930,13 @@ func (pc *PeerConnection) SetIdentityProvider(provider string) error {
 // WriteRTCP sends a user provided RTCP packet to the connected peer. If no peer is connected the
 // packet is discarded. It also runs any configured interceptors.
 func (pc *PeerConnection) WriteRTCP(pkts []rtcp.Packet) error {
+	log.Println(pkts)
 	_, err := pc.interceptorRTCPWriter.Write(pkts, make(interceptor.Attributes))
 	return err
 }
 
 func (pc *PeerConnection) writeRTCP(pkts []rtcp.Packet, _ interceptor.Attributes) (int, error) {
+	log.Println(pkts)
 	return pc.dtlsTransport.WriteRTCP(pkts)
 }
 

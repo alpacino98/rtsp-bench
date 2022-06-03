@@ -287,6 +287,7 @@ func (s *TrackLocalStaticSample) WriteSample(sample media.Sample) error {
 	packets := p.Packetize(sample.Data, samples)
 
 	writeErrs := []error{}
+
 	for _, p := range packets {
 		if err := s.rtpTrack.WriteRTP(p); err != nil {
 			writeErrs = append(writeErrs, err)

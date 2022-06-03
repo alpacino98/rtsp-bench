@@ -38,7 +38,7 @@ func NewPacketizer(mtu uint16, pt uint8, ssrc uint32, payloader Payloader, seque
 		SSRC:        ssrc,
 		Payloader:   payloader,
 		Sequencer:   sequencer,
-		Timestamp:   globalMathRandomGenerator.Uint32(),
+		Timestamp:   0,
 		ClockRate:   clockRate,
 		timegen:     time.Now,
 	}

@@ -121,7 +121,7 @@ func main() {
 }
 
 // The RTSP URL that will be streamed
-const rtspURL = "rtsp://170.93.143.139:1935/rtplive/0b01b57900060075004d823633235daa"
+const rtspURL = "rtsp://admin:12345@192.168.1.162/stream1"
 
 // Connect to an RTSP URL and pull media.
 // Convert H264 to Annex-B, then write to outboundVideoTrack which sends to all PeerConnections
@@ -172,6 +172,7 @@ func rtspConsumer() {
 				pkt.Data = append(annexbNALUStartCode(), pkt.Data...)
 			}
 
+			// log.Println(pkt.Time)
 			bufferDuration := pkt.Time - previousTime
 			previousTime = pkt.Time
 			if err = outboundVideoTrack.WriteSample(media.Sample{Data: pkt.Data, Duration: bufferDuration}); err != nil && err != io.ErrClosedPipe {

@@ -9,9 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
 
-	//"log"
 	"net"
 	"net/textproto"
 	"net/url"
@@ -122,7 +120,6 @@ func DialTimeout(uri string, timeout time.Duration) (self *Client, err error) {
 }
 
 func Dial(uri string) (self *Client, err error) {
-	log.Println("Here")
 	return DialTimeout(uri, 0)
 }
 
@@ -1215,10 +1212,10 @@ func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error
 			A receiver can then synchronize presentation of the audio and video packets by relating
 			their RTP timestamps using the timestamp pairs in RTCP SR packets.
 		*/
-		if stream.firsttimestamp == 0 {
-			stream.firsttimestamp = stream.timestamp
-		}
-		stream.timestamp -= stream.firsttimestamp
+		// if stream.firsttimestamp == 0 {
+		// 	stream.firsttimestamp = stream.timestamp
+		// }
+		// stream.timestamp -= stream.firsttimestamp
 
 		ok = true
 		pkt = stream.pkt
